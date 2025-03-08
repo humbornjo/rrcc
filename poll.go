@@ -6,45 +6,45 @@ import (
 	"fmt"
 	"log/slog"
 	"time"
-
-	"github.com/redis/go-redis/v9"
 )
 
-type optionPoll func(*optionsPoll)
-
-type optionsPoll struct {
-	create       *string
-	interval     int
-	retry        int
-	jitter       func(interval int) int
-	redisTimeout time.Duration
-	onClose      func(poller, error)
-}
+type Updater = func() string
 
 var defaultOptionsPoll = optionsPoll{
-	interval:     10,
-	retry:        3,
-	jitter:       func(interval int) int { return interval },
-	redisTimeout: 5 * time.Second,
-	onClose: func(p poller, err error) {
+	create:   nil,
+	interval: 5,
+	jitter:   func(interval int) int { return interval },
+	onFailHook: func(p poller, err error) {
+		slog.Error(fmt.Sprintf("poller on key %s failed", p.Key()), "err", err)
+	},
+	onCloseHook: func(p poller, err error) {
 		slog.Error(fmt.Sprintf("poller on key %s closed", p.Key()), "err", err)
 	},
 }
 
-type entryPoller struct {
-	key             string
-	val             string
-	fail            int
-	options         optionsPoll
-	connGetter      func() *redis.Client
-	onCloseCallback func(poller, error)
+type poller interface {
+	Key() string
+	Watch(func(event))
+	Update(Updater) error
+
+	Cancel()
 }
 
-func (p *entryPoller) Key() string {
+type basePoller struct {
+	_ctx    context.Context
+	_cancel func()
+	_update func(string, event, Updater) (event, error)
+
+	key     string
+	latest  event
+	options optionsPoll
+}
+
+func (p *basePoller) Key() string {
 	return p.key
 }
 
-func (p *entryPoller) Watch(cb func(event)) {
+func (p *basePoller) Watch(cb func(event)) {
 	ch := p.watchUpdate()
 	go func() {
 		for {
@@ -53,7 +53,6 @@ func (p *entryPoller) Watch(cb func(event)) {
 				if ok {
 					cb(event)
 				} else {
-					slog.Error("channel closed")
 					return
 				}
 			}
@@ -61,87 +60,63 @@ func (p *entryPoller) Watch(cb func(event)) {
 	}()
 }
 
-func (p *entryPoller) watchUpdate() <-chan event {
-	ch := make(chan event)
-	go func() {
-		var err error
-		var val string
+func (p *basePoller) Cancel() {
+	p._cancel()
+}
 
+func (p *basePoller) Update(updateFn Updater) error {
+	_, err := p._update(p.key, p.latest, updateFn)
+	return err
+}
+
+func (p *basePoller) poll() (event, error) {
+	e := p.latest
+	e.version = 0
+	return p._update(p.key, e, nil)
+}
+
+func (p *basePoller) watchUpdate() <-chan event {
+	ch := make(chan event, 32)
+	go func() {
 	loop:
 		for {
-			conn := p.connGetter()
-			ctx, _ := context.WithTimeout(context.Background(), p.options.redisTimeout)
-			if conn == nil {
-				err = errors.New("nil redis connection")
-				goto fail
-			}
-
-			if t := p.options.jitter(p.options.interval); t <= 0 {
-				err = fmt.Errorf("invalid interval sleep time %d", t)
+			select {
+			case <-p._ctx.Done():
 				break loop
-			} else {
-				time.Sleep(time.Duration(t) * time.Second)
-			}
-
-			val, err = conn.Get(ctx, p.key).Result()
-			if err != nil {
-				err = fmt.Errorf("failed to get key %s: %w", p.key, err)
-				goto fail
-			}
-
-			if p.val == "" && p.options.create != nil {
-				ch <- mkEventAdd(val)
-			} else if val != p.val {
-				ch <- mkEventModify(p.val, val)
-			}
-			p.val = val
-			continue
-
-		fail:
-			if p.fail < p.options.retry {
-				p.fail += 1
-			} else {
-				break loop
+			default:
+				e, err := p.poll()
+				p.latest = e
+				if err != nil && !errors.Is(err, errUnchanged) {
+					p.options.onFailHook(p, err)
+				} else {
+					ch <- e
+				}
+				if t := p.options.jitter(p.options.interval); t <= 0 {
+					p.options.onFailHook(p, ErrNegTime)
+				} else {
+					time.Sleep(time.Duration(t) * time.Second)
+				}
 			}
 		}
 		close(ch)
-		p.onCloseCallback(p, err)
+		p.options.onCloseHook(p, ErrStopWatch)
 	}()
 	return ch
 }
 
-func (p *entryPoller) Update(updateFn func() string) error {
-	// set nx
-	conn := p.connGetter()
-	ctx, _ := context.WithTimeout(context.Background(), p.options.redisTimeout)
+type structPoller struct {
+	s any
+	basePoller
+}
 
-	for iflock := false; iflock == false; {
-		res, err := conn.SetNX(ctx, p.key, "", 0).Result()
-		if err != nil {
-			return fmt.Errorf("failed to set key %s: %w", p.key, err)
-		}
-		iflock = res
-		time.Sleep(100 * time.Millisecond)
-	}
+type optionPoll func(*optionsPoll)
 
-	// if set successfully, double check the val in redis
-	val, err := conn.Get(ctx, p.key).Result()
-	if err != nil {
-		// p.onCloseCallback(p, err)
-	}
-
-	if val != p.val {
-		p.val = val
-	} else {
-		// if val is the same as the old one, then emit the update
-		p.val = updateFn()
-		conn.Set(ctx, p.key, p.val, 0)
-	}
-
-	// unset nx lock
-	conn.Del(ctx, p.key)
-
-	return nil
+type optionsPoll struct {
+	create      *string
+	interval    int
+	jitter      func(interval int) int
+	onFailHook  func(poller, error)
+	onCloseHook func(poller, error)
 }
 
 func WithDefaultValue(value string) optionPoll {
@@ -159,26 +134,20 @@ func WithInterval(interval int) optionPoll {
 	}
 }
 
-func WithRetry(retry int) optionPoll {
-	return func(opts *optionsPoll) {
-		opts.retry = retry
-	}
-}
-
 func WithJitter(jitter func(interval int) int) optionPoll {
 	return func(opts *optionsPoll) {
 		opts.jitter = jitter
 	}
 }
 
-func WithRedisTimeout(timeout time.Duration) optionPoll {
+func WithOnCloseHook(onClose func(poller, error)) optionPoll {
 	return func(opts *optionsPoll) {
-		opts.redisTimeout = timeout
+		opts.onCloseHook = onClose
 	}
 }
 
-func WithOnClose(onClose func(poller, error)) optionPoll {
+func WithOnFailHook(onFail func(poller, error)) optionPoll {
 	return func(opts *optionsPoll) {
-		opts.onClose = onClose
+		opts.onFailHook = onFail
 	}
 }
