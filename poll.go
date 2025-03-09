@@ -6,45 +6,50 @@ import (
 	"fmt"
 	"log/slog"
 	"time"
+	"unsafe"
+
+	"github.com/humbornjo/rrcc/internal/event"
 )
 
 type Updater = func() string
 
 var defaultOptionsPoll = optionsPoll{
-	create:   nil,
-	interval: 5,
-	jitter:   func(interval int) int { return interval },
-	onFailHook: func(p poller, err error) {
+	interval:         5,
+	enableEncryption: false,
+
+	_create: nil,
+	_jitter: func(interval int) int { return interval },
+	_onFailHook: func(p poller, err error) {
 		slog.Error(fmt.Sprintf("poller on key %s failed", p.Key()), "err", err)
 	},
-	onCloseHook: func(p poller, err error) {
+	_onCloseHook: func(p poller, err error) {
 		slog.Error(fmt.Sprintf("poller on key %s closed", p.Key()), "err", err)
 	},
 }
 
 type poller interface {
-	Key() string
-	Watch(func(event))
-	Update(Updater) error
-
 	Cancel()
+	Key() string
+	Watch(func(Event))
+	Update(Updater) error
 }
 
 type basePoller struct {
+	key     string
+	latest  Event
+	options optionsPoll
+
+	_addr   unsafe.Pointer
 	_ctx    context.Context
 	_cancel func()
-	_update func(string, event, Updater) (event, error)
-
-	key     string
-	latest  event
-	options optionsPoll
+	_update func(string, Event, Updater) (Event, error)
 }
 
 func (p *basePoller) Key() string {
 	return p.key
 }
 
-func (p *basePoller) Watch(cb func(event)) {
+func (p *basePoller) Watch(cb func(Event)) {
 	ch := p.watchUpdate()
 	go func() {
 		for {
@@ -61,6 +66,7 @@ func (p *basePoller) Watch(cb func(event)) {
 }
 
 func (p *basePoller) Cancel() {
+	p._addr = nil
 	p._cancel()
 }
 
@@ -69,14 +75,14 @@ func (p *basePoller) Update(updateFn Updater) error {
 	return err
 }
 
-func (p *basePoller) poll() (event, error) {
+func (p *basePoller) poll() (Event, error) {
 	e := p.latest
-	e.version = 0
+	e.Version = 0
 	return p._update(p.key, e, nil)
 }
 
-func (p *basePoller) watchUpdate() <-chan event {
-	ch := make(chan event, 32)
+func (p *basePoller) watchUpdate() <-chan Event {
+	ch := make(chan Event, 32)
 	go func() {
 	loop:
 		for {
@@ -86,20 +92,20 @@ func (p *basePoller) watchUpdate() <-chan event {
 			default:
 				e, err := p.poll()
 				p.latest = e
-				if err != nil && !errors.Is(err, errUnchanged) {
-					p.options.onFailHook(p, err)
+				if err != nil && !errors.Is(err, event.ErrUnchanged) {
+					p.options._onFailHook(p, err)
 				} else {
 					ch <- e
 				}
-				if t := p.options.jitter(p.options.interval); t <= 0 {
-					p.options.onFailHook(p, ErrNegTime)
+				if t := p.options._jitter(p.options.interval); t <= 0 {
+					p.options._onFailHook(p, ErrNegTime)
 				} else {
 					time.Sleep(time.Duration(t) * time.Second)
 				}
 			}
 		}
 		close(ch)
-		p.options.onCloseHook(p, ErrStopWatch)
+		p.options._onCloseHook(p, ErrStopWatch)
 	}()
 	return ch
 }
@@ -112,11 +118,13 @@ type structPoller struct {
 type optionPoll func(*optionsPoll)
 
 type optionsPoll struct {
-	create      *string
-	interval    int
-	jitter      func(interval int) int
-	onFailHook  func(poller, error)
-	onCloseHook func(poller, error)
+	enableEncryption bool
+	interval         int
+
+	_create      *string
+	_jitter      func(interval int) int
+	_onFailHook  func(poller, error)
+	_onCloseHook func(poller, error)
 }
 
 func WithDefaultValue(value string) optionPoll {
@@ -124,7 +132,7 @@ func WithDefaultValue(value string) optionPoll {
 		if value == "" {
 			return
 		}
-		opts.create = &value
+		opts._create = &value
 	}
 }
 
@@ -136,18 +144,24 @@ func WithInterval(interval int) optionPoll {
 
 func WithJitter(jitter func(interval int) int) optionPoll {
 	return func(opts *optionsPoll) {
-		opts.jitter = jitter
+		opts._jitter = jitter
 	}
 }
 
 func WithOnCloseHook(onClose func(poller, error)) optionPoll {
 	return func(opts *optionsPoll) {
-		opts.onCloseHook = onClose
+		opts._onCloseHook = onClose
 	}
 }
 
 func WithOnFailHook(onFail func(poller, error)) optionPoll {
 	return func(opts *optionsPoll) {
-		opts.onFailHook = onFail
+		opts._onFailHook = onFail
+	}
+}
+
+func WithEncryption(enable bool) optionPoll {
+	return func(opts *optionsPoll) {
+		opts.enableEncryption = enable
 	}
 }
