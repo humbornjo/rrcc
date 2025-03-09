@@ -4,32 +4,44 @@ import (
 	"context"
 
 	"github.com/redis/go-redis/v9"
+
+	"github.com/humbornjo/rrcc/internal/event"
 )
+
+const (
+	ADD = event.ADD
+	CHG = event.CHG
+	DEL = event.DEL
+)
+
+type Event = event.Event
 
 type Client interface {
 	Stop()
-	String(string, ...optionPoll) poller
+	Data(string, ...optionPoll) poller
 	// Bind(string, any, ...optionPoll) poller
 
 	watch(context.Context)
-	update(string, event, func() string) (event, error)
+	update(string, event.Event, func() string) (Event, error)
 }
 
-func FromOptions(ctx context.Context, opts redis.Options, prefix string) (Client, error) {
-	redisClient := redis.NewClient(&opts)
-	if err := redisClient.Ping(ctx).Err(); err != nil {
-		return nil, err
-	}
-	return initClient(ctx, func() *redis.Client { return redisClient }), nil
+func FromOptions(ctx context.Context, options redis.Options, opts ...optionClient) (Client, error) {
+	redisClient := redis.NewClient(&options)
+	return clientInit(ctx, func() *redis.Client { return redisClient })
 }
 
-func FromGetConn(ctx context.Context, getConn func() *redis.Client, prefix string) (Client, error) {
+func FromGetConn(ctx context.Context, getConn func() *redis.Client, opts ...optionClient) (Client, error) {
 	if getConn() == nil {
 		return nil, ErrNilConn
 	}
+	return clientInit(ctx, getConn)
+}
 
-	if err := getConn().Ping(ctx).Err(); err != nil {
-		return nil, err
-	}
-	return initClient(ctx, getConn), nil
+type optionsClient struct {
+	prefix string
+}
+type optionClient func(*optionsClient)
+
+var defaultOptionsClient = optionsClient{
+	prefix: "rrcc",
 }
