@@ -2,7 +2,6 @@ package rrcc
 
 import (
 	"context"
-	"encoding/base64"
 	"time"
 	"unsafe"
 	"weak"
@@ -36,7 +35,7 @@ func clientInit(ctx context.Context, fn func() *redis.Client) (*client, error) {
 		_ch:      make(chan eventWatch, 32),
 		_ctx:     cctx,
 		_cancel:  cancel,
-		_iclient: iredis.WrappedRedis{GetConn: fn},
+		_iclient: *iredis.NewIredis(fn),
 	}
 
 	if err := fn().Ping(ctx).Err(); err != nil {
@@ -63,7 +62,7 @@ func (p *client) Data(key string, opts ...optionPoll) poller {
 			}
 			es := make([]Event, 0)
 			ptr = unsafe.Pointer(&es)
-			p._ch <- eventWatch{key: p.fullKey(key), _addr: weak.Make(&es)}
+			p._ch <- eventWatch{key: key, _addr: weak.Make(&es)}
 			return weak.Make(&es), true
 		})
 
@@ -94,39 +93,20 @@ func (p *client) watch(ctx context.Context) {
 	go func() {
 		for {
 			select {
-			case <-ticker.C:
-				ewsNew := make([]eventWatch, 0, len(ews))
-				for _, ew := range ews {
-					// TODO: implement
-					if pes := ew._addr.Value(); pes != nil {
-						ewsNew = append(ewsNew, ew)
-						go func() {
-							e, err := p._iclient.AtomicGet(ctx, p.fullKey(ew.key))
-							if err != nil {
-								return
-							}
-							p.mcache.AtomicPut(
-								ew.key,
-								func(oldV weak.Pointer[[]Event], exists bool) (weak.Pointer[[]Event], bool) {
-									if !exists {
-										panic("unreachable")
-									}
-									if pes := oldV.Value(); pes == nil {
-										panic("unreachable")
-									} else {
-										*pes = append(*pes, e)
-										return oldV, false
-									}
-								})
-						}()
-					}
-				}
-				ews = ewsNew
-			case ew := <-p._ch:
-				ews = append(ews, ew)
 			case <-p._ctx.Done():
 				p._cancel()
 				return
+			case ew := <-p._ch:
+				ews = append(ews, ew)
+			case <-ticker.C:
+				ewsNew := make([]eventWatch, 0, len(ews))
+				for _, ew := range ews {
+					if pes := ew._addr.Value(); pes != nil {
+						ewsNew = append(ewsNew, ew)
+						go p.updateCache(ctx, ew, time.Now())
+					}
+				}
+				ews = ewsNew
 			}
 		}
 	}()
@@ -142,37 +122,58 @@ func (p *client) update(key string, oldValue Event, upd Updater) (Event, error) 
 		}
 	}
 
-	fokey := p.fullKey(key)
 	tctx, cancel := context.WithTimeout(p._ctx, 5*time.Second)
 	defer cancel()
 
 	// If the evnets in cache are not as up-to-date as the given one, search redis for the newest one
-	if newValue, err := p._iclient.AtomicGet(tctx, fokey); err == nil &&
+	if newValue, err := p._iclient.AtomicGet(tctx, key); err == nil &&
 		newValue.Version > oldValue.Version {
 		return oldValue.MergeEvents([]Event{newValue})
 	}
 
+	// If no updator is provided, then return, omit the updating phase
+	if upd == nil {
+		return oldValue, nil
+	}
+
 	// Recently event from redis is still not as up to date as the given one, try setNX, ready to update
-	if !p._iclient.BlockOnSetNX(tctx, fokey) {
+	if !p._iclient.BlockOnSetNX(tctx, key) {
 		return oldValue, ErrRedisSetNX
 	}
 
 	// Set successfully, double check the event in redis to make sure it really need to be updated
-	if newValue, err := p._iclient.AtomicGet(tctx, fokey); err == nil &&
+	if newValue, err := p._iclient.AtomicGet(tctx, key); err == nil &&
 		newValue.Version > oldValue.Version {
 		return oldValue.MergeEvents([]Event{newValue})
 	}
 
 	// Generate the new value, making event and set it redis, INCR the version
-	if newValue, err := p._iclient.AtomicSet(tctx, fokey, upd()); err != nil {
+	if newValue, err := p._iclient.AtomicSet(tctx, key, upd()); err != nil {
 		return oldValue, err
 	} else {
 		return oldValue.MergeEvents([]Event{newValue})
 	}
 }
 
-func (p *client) fullKey(key string) string {
-	prefixedKey := "rrcc:" + key
-	nonce := base64.StdEncoding.EncodeToString([]byte(prefixedKey))
-	return prefixedKey + ":" + nonce
+// Event is updated every 10 seconds by default, if the order needs perfectly ensured, then we still need
+// a timestamp to record the sequence on client side. And, this timestamp should better be aligned among
+// all clients. Thus the perfect choice is nanosecond timestamp.
+func (p *client) updateCache(ctx context.Context, ew eventWatch, _ time.Time) {
+	e, err := p._iclient.AtomicGet(ctx, ew.key)
+	if err != nil {
+		return
+	}
+	p.mcache.AtomicPut(
+		ew.key,
+		func(oldV weak.Pointer[[]Event], exists bool) (weak.Pointer[[]Event], bool) {
+			if !exists {
+				panic("unreachable")
+			}
+			if pes := oldV.Value(); pes == nil {
+				panic("unreachable")
+			} else {
+				*pes = append(*pes, e)
+				return oldV, false
+			}
+		})
 }

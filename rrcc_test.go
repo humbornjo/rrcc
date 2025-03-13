@@ -2,27 +2,36 @@ package rrcc
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"log/slog"
 	"testing"
 	"time"
 
+	"github.com/humbornjo/rrcc/internal/iredis"
 	"github.com/redis/go-redis/v9"
 )
 
+const (
+	testKey = "test_key"
+)
+
+var testRedisCfg = redis.Options{
+	Addr:     "localhost:6379",
+	Username: "defualt",
+	Password: "", // no password set
+	DB:       0,  // use default DB
+}
+
 func TestA(t *testing.T) {
 	ctx := context.Background()
-	client, err := FromOptions(ctx, redis.Options{
-		Addr:     "localhost:6379",
-		Username: "defualt",
-		Password: "", // no password set
-		DB:       0,  // use default DB
-	})
+	client, err := FromOptions(ctx, testRedisCfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer client.Stop()
 
-	kpoller := client.Data("test_key")
+	kpoller := client.Data(testKey)
 	kpoller.Watch(func(e Event) {
 		defer func() {
 			if r := recover(); r != nil {
@@ -39,12 +48,23 @@ func TestA(t *testing.T) {
 		}
 	})
 
-	time.Sleep(10 * time.Second)
+	time.Sleep(100000 * time.Second)
 
 	kpoller.Update(func() string {
-		return "test_value_1"
+		return time.Now().String()
 	})
 
 	time.Sleep(10 * time.Second)
 
+}
+
+func TestAtomicOp(t *testing.T) {
+	ctx := context.Background()
+	rclient := redis.NewClient(&testRedisCfg)
+	iclient := iredis.NewIredis(func() *redis.Client { return rclient })
+	resp, err := iclient.AtomicGet(ctx, testKey)
+	jstr, _ := json.Marshal(resp)
+	fmt.Println(string(jstr), err)
+
+	t.Fail()
 }

@@ -30,11 +30,11 @@ func FromOptions(ctx context.Context, options redis.Options, opts ...optionClien
 	return clientInit(ctx, func() *redis.Client { return redisClient })
 }
 
-func FromGetConn(ctx context.Context, getConn func() *redis.Client, opts ...optionClient) (Client, error) {
-	if getConn() == nil {
+func FromGetConn(ctx context.Context, fn func() *redis.Client, opts ...optionClient) (Client, error) {
+	if fn() == nil {
 		return nil, ErrNilConn
 	}
-	return clientInit(ctx, getConn)
+	return clientInit(ctx, fn)
 }
 
 type optionsClient struct {
