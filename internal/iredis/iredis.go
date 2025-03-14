@@ -23,7 +23,7 @@ func NewIredis(fn func() *redis.Client, prefix ...string) *WrappedRedis {
 	return &WrappedRedis{_getConn: fn, prefix: prefix[0]}
 }
 
-func (p *WrappedRedis) AtomicGet(ctx context.Context, key string) (event.Event, error) {
+func (p *WrappedRedis) Get(ctx context.Context, key string) (event.Event, error) {
 	conn := p._getConn()
 	cmds, err := conn.Pipelined(ctx, func(pipe redis.Pipeliner) error {
 		pipe.Get(ctx, p.keyData(key))
@@ -54,7 +54,7 @@ func (p *WrappedRedis) AtomicGet(ctx context.Context, key string) (event.Event, 
 	return event.MkEventChg(val, val, ver), nil
 }
 
-func (p *WrappedRedis) AtomicSet(ctx context.Context, key string, value string) (event.Event, error) {
+func (p *WrappedRedis) Set(ctx context.Context, key string, value string) (event.Event, error) {
 	conn := p._getConn()
 	cmds, err := conn.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 		pipe.GetSet(ctx, p.keyData(key), value)
@@ -80,7 +80,7 @@ func (p *WrappedRedis) AtomicSet(ctx context.Context, key string, value string) 
 	return event.MkEventChg(value, value, uint64(newVer)), nil
 }
 
-func (p *WrappedRedis) BlockOnSetNX(ctx context.Context, key string) bool {
+func (p *WrappedRedis) BlockSetNX(ctx context.Context, key, value string) bool {
 	conn := p._getConn()
 	expiration := 5 * time.Second
 	retryInterval := 100 * time.Millisecond // Retry every 100ms
@@ -90,7 +90,7 @@ func (p *WrappedRedis) BlockOnSetNX(ctx context.Context, key string) bool {
 		case <-ctx.Done():
 			return false
 		default:
-			cmd := conn.SetNX(ctx, p.keyLock(key), "locked", expiration)
+			cmd := conn.SetNX(ctx, p.keyLock(key), value, expiration)
 			if cmd.Err() != nil {
 				time.Sleep(retryInterval)
 				continue
@@ -102,4 +102,17 @@ func (p *WrappedRedis) BlockOnSetNX(ctx context.Context, key string) bool {
 			time.Sleep(retryInterval)
 		}
 	}
+}
+
+// Unlock deletes the lock key only if its value matches the provided value
+func (p *WrappedRedis) MatchDelNX(ctx context.Context, key, value string) error {
+	script := redis.NewScript(`
+        if redis.call("get", KEYS[1]) == ARGV[1] then
+            return redis.call("del", KEYS[1])
+        else
+            return 0
+        end
+    `)
+	_, err := script.Run(ctx, p._getConn(), []string{p.keyLock(key)}, value).Result()
+	return err
 }

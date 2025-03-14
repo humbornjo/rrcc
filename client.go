@@ -6,6 +6,7 @@ import (
 	"unsafe"
 	"weak"
 
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/humbornjo/rrcc/internal/btree"
@@ -126,7 +127,7 @@ func (p *client) update(key string, oldValue Event, upd Updater) (Event, error) 
 	defer cancel()
 
 	// If the evnets in cache are not as up-to-date as the given one, search redis for the newest one
-	if newValue, err := p._iclient.AtomicGet(tctx, key); err == nil &&
+	if newValue, err := p._iclient.Get(tctx, key); err == nil &&
 		newValue.Version > oldValue.Version {
 		return oldValue.MergeEvents([]Event{newValue})
 	}
@@ -137,18 +138,20 @@ func (p *client) update(key string, oldValue Event, upd Updater) (Event, error) 
 	}
 
 	// Recently event from redis is still not as up to date as the given one, try setNX, ready to update
-	if !p._iclient.BlockOnSetNX(tctx, key) {
+	if lockValue := uuid.New().String(); !p._iclient.BlockSetNX(tctx, key, lockValue) {
 		return oldValue, ErrRedisSetNX
+	} else {
+		defer p._iclient.MatchDelNX(tctx, key, lockValue)
 	}
 
 	// Set successfully, double check the event in redis to make sure it really need to be updated
-	if newValue, err := p._iclient.AtomicGet(tctx, key); err == nil &&
+	if newValue, err := p._iclient.Get(tctx, key); err == nil &&
 		newValue.Version > oldValue.Version {
 		return oldValue.MergeEvents([]Event{newValue})
 	}
 
 	// Generate the new value, making event and set it redis, INCR the version
-	if newValue, err := p._iclient.AtomicSet(tctx, key, upd()); err != nil {
+	if newValue, err := p._iclient.Set(tctx, key, upd()); err != nil {
 		return oldValue, err
 	} else {
 		return oldValue.MergeEvents([]Event{newValue})
@@ -159,7 +162,7 @@ func (p *client) update(key string, oldValue Event, upd Updater) (Event, error) 
 // a timestamp to record the sequence on client side. And, this timestamp should better be aligned among
 // all clients. Thus the perfect choice is nanosecond timestamp.
 func (p *client) updateCache(ctx context.Context, ew eventWatch, _ time.Time) {
-	e, err := p._iclient.AtomicGet(ctx, ew.key)
+	e, err := p._iclient.Get(ctx, ew.key)
 	if err != nil {
 		return
 	}

@@ -62,7 +62,7 @@ func TestAtomicOp(t *testing.T) {
 	ctx := context.Background()
 	rclient := redis.NewClient(&testRedisCfg)
 	iclient := iredis.NewIredis(func() *redis.Client { return rclient })
-	resp, err := iclient.AtomicGet(ctx, testKey)
+	resp, err := iclient.Get(ctx, testKey)
 	jstr, _ := json.Marshal(resp)
 	fmt.Println(string(jstr), err)
 

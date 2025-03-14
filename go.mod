@@ -3,6 +3,7 @@ module github.com/humbornjo/rrcc
 go 1.23.4
 
 require (
+	github.com/google/uuid v1.6.0
 	github.com/redis/go-redis/v9 v9.7.1
 	modernc.org/b/v2 v2.1.2
 )
