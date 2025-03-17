@@ -143,18 +143,22 @@ func (p *client) update(key string, oldEvent Event, upd Updater) (Event, error) 
 	if newEvent, err := p._iclient.Get(tctx, key); err == nil {
 		if newEvent.Version > oldEvent.Version {
 			return oldEvent.MergeEvents([]Event{newEvent})
-		} else if newEvent.Version == oldEvent.Version {
-			if upd == nil {
-				return oldEvent.MergeEvents([]Event{newEvent})
-			}
-		} else {
-			upd = func() string { return oldEvent.NewValue }
 		}
+		if upd == nil {
+			if newEvent.Version == oldEvent.Version {
+				return oldEvent.MergeEvents([]Event{newEvent})
+			} else if newEvent.Version < oldEvent.Version {
+				ver = max(newEvent.Version, ver)
+				upd = func() string { return newEvent.NewValue }
+			}
+		}
+	} else if upd == nil && err == redis.Nil {
+		upd = func() string { return oldEvent.NewValue }
 	}
 
 	// Generate the new value, making event and set it redis, INCR the version
 	newEvent, err := p._iclient.Set(tctx, key, upd(), ver)
-	if err != nil {
+	if err != nil && err != redis.Nil {
 		return oldEvent, err
 	}
 
@@ -182,6 +186,8 @@ func (p *client) _update(ctx context.Context, key string, oldEvent Event) (Event
 		} else {
 			return oldEvent.MergeEvents([]Event{newEvent})
 		}
+	} else if newEvent.Version < oldEvent.Version && err == redis.Nil {
+		return oldEvent, ErrRemoteOutOfDate
 	}
 
 	return oldEvent, event.ErrUnchanged

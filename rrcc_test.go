@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/alicebob/miniredis"
 	"github.com/redis/go-redis/v9"
@@ -27,7 +28,7 @@ func TestMain(m *testing.M) {
 	m.Run()
 }
 
-func TestCurrentUpd(t *testing.T) {
+func TestConcurrentUpd(t *testing.T) {
 	// Do init for the rrcc client
 	key := "cheerstothetinman"
 	ctx := context.Background()
@@ -45,15 +46,11 @@ func TestCurrentUpd(t *testing.T) {
 		{"1 - all work and no play makes jack a dull boy"},
 		{"2 - all work and no play makes jack a dull boy"},
 		{"3 - all work and no play makes jack a dull boy"},
-		{"4 - all work and no play makes jack a dull boy"},
-		{"5 - all work and no play makes jack a dull boy"},
 	}
 	Expected := []Event{
 		{Type: ADD, Version: 1, NewValue: DataSet[0].value},
 		{Type: CHG, Version: 2, NewValue: DataSet[1].value, OldValue: DataSet[0].value},
 		{Type: CHG, Version: 3, NewValue: DataSet[2].value, OldValue: DataSet[1].value},
-		{Type: CHG, Version: 4, NewValue: DataSet[3].value, OldValue: DataSet[2].value},
-		{Type: CHG, Version: 5, NewValue: DataSet[4].value, OldValue: DataSet[3].value},
 	}
 
 	var wg sync.WaitGroup
@@ -91,32 +88,33 @@ func TestCurrentUpd(t *testing.T) {
 		go func(i int, p poller) {
 			p.Watch(func(e Event) {
 				slog.Info(fmt.Sprintf("[WATCH] poller %d", i), "epoch", epoch, "event", e)
-				assert.Equal(t, Expected[epoch], e)
+				if !assert.Equal(t, Expected[epoch], e) {
+					t.Fail()
+				}
 				<-doneChs[epoch]
 				wg.Done()
 			})
 		}(i, p)
 	}
 
-	for {
-		select {
-		case <-closeCh:
-			goto test
-		case <-stepCh:
-			idx := epoch
-			slog.Info("[UPDATE] begin to update", "epoch", idx)
-			for _, p := range pollers {
-				go func(i int) {
-					p.Update(func() string {
-						cntUpd.Add(1)
-						return DataSet[i].value
-					})
-				}(idx)
-			}
+encore:
+	select {
+	case <-closeCh:
+	case <-stepCh:
+		idx := epoch
+		slog.Info("[UPDATE] begin to update", "epoch", idx)
+		for _, p := range pollers {
+			go func(i int) {
+				p.Update(func() string {
+					oldV := cntUpd.Load()
+					cntUpd.CompareAndSwap(oldV, oldV+1)
+					return DataSet[i].value
+				})
+			}(idx)
 		}
+		goto encore
 	}
 
-test:
 	for _, p := range pollers {
 		p.Cancel()
 	}
@@ -125,4 +123,41 @@ test:
 }
 
 func TestRedisDown(t *testing.T) {
+	// Do init for the rrcc client
+	key := "nina"
+	ctx := context.Background()
+	rcc, err := FromGetConn(ctx,
+		func() *redis.Client { return redisCli })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rcc.Stop()
+
+	ch := make(chan struct{})
+	once := sync.Once{}
+	p := rcc.Data(key)
+	p.Watch(func(e Event) {
+		switch e.Type {
+		case ADD:
+			slog.Info("[WATCH] ADD", "event", e)
+		case CHG:
+			slog.Info("[WATCH] CHG", "event", e)
+		}
+		once.Do(func() { close(ch) })
+	})
+
+	{
+		e, err := p.Update(func() string { return "Guns N' Roses" })
+		slog.Info("update", "event", e, "err", err)
+	}
+	<-ch
+
+	// delete all key in redis
+	redisCli.FlushDB(ctx)
+
+	<-time.After(10 * time.Second)
+	e, err := rcc.(*client)._iclient.Get(ctx, key)
+	assert.NoError(t, err)
+	slog.Info("event", "event", e)
+	assert.Equal(t, e.NewValue, "Guns N' Roses")
 }

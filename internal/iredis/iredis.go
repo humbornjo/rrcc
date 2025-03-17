@@ -68,20 +68,23 @@ func (p *WrappedRedis) Set(ctx context.Context, key string, value string, ver in
 
 	// If the original value is nil, use event ADD
 	getSetCmd := cmds[0].(*redis.StringCmd)
-	if getSetCmd.Err() == redis.Nil {
-		return event.MkEventAdd("", 0), nil
-	} else if getSetCmd.Err() != nil {
+	if getSetCmd.Err() != nil && getSetCmd.Err() != redis.Nil {
 		return event.MkEventChg("", "", 0), err
 	}
 
 	if ver > 0 {
+		err := cmds[1].(*redis.StatusCmd).Err()
+		if err != nil && err != redis.Nil {
+			return event.MkEventChg("", "", 0), err
+		}
 		return event.MkEventChg(value, value, ver), nil
 	}
 	incrCmd := cmds[1].(*redis.IntCmd)
 	newVer, err := incrCmd.Result()
-	if err != nil {
+	if err != nil && err != redis.Nil {
 		return event.MkEventChg("", "", 0), err
 	}
+
 	return event.MkEventChg(value, value, newVer), nil
 }
 

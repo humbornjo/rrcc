@@ -50,6 +50,10 @@ func (p Event) MergeEvents(events []Event) (Event, error) {
 	}
 
 	last := events[len(events)-1]
+	if last.Version < p.Version {
+		return p, ErrUnchanged
+	}
+
 	switch p.Type {
 	case DEL:
 		// if p's type is DEL, then new event is
