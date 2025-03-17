@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -31,7 +32,7 @@ type poller interface {
 	Cancel()
 	Key() string
 	Watch(func(Event))
-	Update(Updater) error
+	Update(Updater) (Event, error)
 }
 
 type basePoller struct {
@@ -39,6 +40,7 @@ type basePoller struct {
 	latest  Event
 	options optionsPoll
 
+	_mu     sync.RWMutex
 	_addr   unsafe.Pointer
 	_ctx    context.Context
 	_cancel func()
@@ -70,30 +72,36 @@ func (p *basePoller) Cancel() {
 	p._cancel()
 }
 
-func (p *basePoller) Update(updateFn Updater) error {
-	_, err := p._update(p.key, p.latest, updateFn)
-	return err
+func (p *basePoller) Update(fn Updater) (Event, error) {
+	p._mu.RLock()
+	e := p.latest
+	p._mu.RUnlock()
+	return p._update(p.key, e, fn)
 }
 
 func (p *basePoller) poll() (Event, error) {
+	p._mu.RLock()
 	e := p.latest
-	e.Version = 0
+	p._mu.RUnlock()
 	return p._update(p.key, e, nil)
 }
 
 func (p *basePoller) watchUpdate() <-chan Event {
 	ch := make(chan Event, 32)
 	go func() {
-	loop:
 		for {
 			select {
 			case <-p._ctx.Done():
-				break loop
+				goto exit
 			default:
 				e, err := p.poll()
+				p._mu.Lock()
 				p.latest = e
-				if err != nil && !errors.Is(err, event.ErrUnchanged) {
-					p.options._onFailHook(p, err)
+				p._mu.Unlock()
+				if err != nil {
+					if !errors.Is(err, event.ErrUnchanged) {
+						p.options._onFailHook(p, err)
+					}
 				} else {
 					ch <- e
 				}
@@ -104,6 +112,7 @@ func (p *basePoller) watchUpdate() <-chan Event {
 				}
 			}
 		}
+	exit:
 		close(ch)
 		p.options._onCloseHook(p, ErrStopWatch)
 	}()

@@ -2,69 +2,127 @@ package rrcc
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sync"
+	"sync/atomic"
 	"testing"
-	"time"
 
-	"github.com/humbornjo/rrcc/internal/iredis"
+	"github.com/alicebob/miniredis"
 	"github.com/redis/go-redis/v9"
+	"github.com/stretchr/testify/assert"
 )
 
-const (
-	testKey = "test_key"
+var (
+	redisSvr *miniredis.Miniredis
+	redisCli *redis.Client
 )
 
-var testRedisCfg = redis.Options{
-	Addr:     "localhost:6379",
-	Username: "defualt",
-	Password: "", // no password set
-	DB:       0,  // use default DB
+func TestMain(m *testing.M) {
+	redisSvr, _ = miniredis.Run()
+	defer redisSvr.Close()
+	redisCli = redis.NewClient(
+		&redis.Options{Addr: redisSvr.Addr()},
+	)
+	m.Run()
 }
 
-func TestA(t *testing.T) {
+func TestCurrentUpd(t *testing.T) {
+	// Do init for the rrcc client
+	key := "cheerstothetinman"
 	ctx := context.Background()
-	client, err := FromOptions(ctx, testRedisCfg)
+	client, err := FromGetConn(ctx,
+		func() *redis.Client { return redisCli })
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer client.Stop()
 
-	kpoller := client.Data(testKey)
-	kpoller.Watch(func(e Event) {
-		defer func() {
-			if r := recover(); r != nil {
-				slog.Error("watch update callback panic")
+	// Prepare test data
+	DataSet := []struct {
+		value string
+	}{
+		{"1 - all work and no play makes jack a dull boy"},
+		{"2 - all work and no play makes jack a dull boy"},
+		{"3 - all work and no play makes jack a dull boy"},
+		{"4 - all work and no play makes jack a dull boy"},
+		{"5 - all work and no play makes jack a dull boy"},
+	}
+	Expected := []Event{
+		{Type: ADD, Version: 1, NewValue: DataSet[0].value},
+		{Type: CHG, Version: 2, NewValue: DataSet[1].value, OldValue: DataSet[0].value},
+		{Type: CHG, Version: 3, NewValue: DataSet[2].value, OldValue: DataSet[1].value},
+		{Type: CHG, Version: 4, NewValue: DataSet[3].value, OldValue: DataSet[2].value},
+		{Type: CHG, Version: 5, NewValue: DataSet[4].value, OldValue: DataSet[3].value},
+	}
+
+	var wg sync.WaitGroup
+	cntUpd := atomic.Int32{}
+	epoch := 0
+	concurrency := 500
+	pollers := make([]poller, 0)
+	stepCh := make(chan struct{}, 1)
+	closeCh := make(chan struct{}, 1)
+
+	doneChs := make([]chan struct{}, len(Expected))
+	for i := range doneChs {
+		doneChs[i] = make(chan struct{}, 1)
+	}
+
+	go func() {
+		for {
+			wg.Add(concurrency)
+			slog.Info("[WATCH] wg reinitialize", "epoch", epoch)
+			stepCh <- struct{}{}
+			close(doneChs[epoch])
+
+			wg.Wait()
+			epoch += 1
+			if epoch == len(Expected) {
+				close(closeCh)
+				return
 			}
-		}()
-		switch e.Type {
-		case ADD:
-			slog.Info("ADD", "event", e)
-		case CHG:
-			slog.Info("CHG", "event", e)
-		case DEL:
-			slog.Info("DEL", "event", e)
 		}
-	})
+	}()
 
-	time.Sleep(100000 * time.Second)
+	for i := range concurrency {
+		p := client.Data(key)
+		pollers = append(pollers, p)
+		go func(i int, p poller) {
+			p.Watch(func(e Event) {
+				slog.Info(fmt.Sprintf("[WATCH] poller %d", i), "epoch", epoch, "event", e)
+				assert.Equal(t, Expected[epoch], e)
+				<-doneChs[epoch]
+				wg.Done()
+			})
+		}(i, p)
+	}
 
-	kpoller.Update(func() string {
-		return time.Now().String()
-	})
+	for {
+		select {
+		case <-closeCh:
+			goto test
+		case <-stepCh:
+			idx := epoch
+			slog.Info("[UPDATE] begin to update", "epoch", idx)
+			for _, p := range pollers {
+				go func(i int) {
+					p.Update(func() string {
+						cntUpd.Add(1)
+						return DataSet[i].value
+					})
+				}(idx)
+			}
+		}
+	}
 
-	time.Sleep(10 * time.Second)
+test:
+	for _, p := range pollers {
+		p.Cancel()
+	}
 
+	assert.Equal(t, len(Expected), int(cntUpd.Load()))
 }
 
-func TestAtomicOp(t *testing.T) {
-	ctx := context.Background()
-	rclient := redis.NewClient(&testRedisCfg)
-	iclient := iredis.NewIredis(func() *redis.Client { return rclient })
-	resp, err := iclient.Get(ctx, testKey)
-	jstr, _ := json.Marshal(resp)
-	fmt.Println(string(jstr), err)
-
-	t.Fail()
+func TestRedisDown(t *testing.T) {
 }

@@ -39,10 +39,10 @@ func (p *WrappedRedis) Get(ctx context.Context, key string) (event.Event, error)
 	} else if cmds[0].Err() == redis.Nil {
 		return event.MkEventDel("", 0), cmds[0].Err()
 	}
-	var ver uint64
+	var ver int64
 	if cmds[1].Err() == nil {
 		verStr := cmds[1].(*redis.StringCmd).Val()
-		ver, err = strconv.ParseUint(verStr, 10, 64)
+		ver, err = strconv.ParseInt(verStr, 10, 64)
 		if err != nil {
 			return event.MkEventChg("", "", 0), err
 		}
@@ -54,30 +54,35 @@ func (p *WrappedRedis) Get(ctx context.Context, key string) (event.Event, error)
 	return event.MkEventChg(val, val, ver), nil
 }
 
-func (p *WrappedRedis) Set(ctx context.Context, key string, value string) (event.Event, error) {
+func (p *WrappedRedis) Set(ctx context.Context, key string, value string, ver int64) (event.Event, error) {
 	conn := p._getConn()
 	cmds, err := conn.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 		pipe.GetSet(ctx, p.keyData(key), value)
-		pipe.Incr(ctx, p.keyVersion(key))
+		if ver > 0 {
+			pipe.Set(ctx, p.keyVersion(key), ver, 0)
+		} else {
+			pipe.Incr(ctx, p.keyVersion(key))
+		}
 		return nil
 	})
-	if err != nil {
+
+	// If the original value is nil, use event ADD
+	getSetCmd := cmds[0].(*redis.StringCmd)
+	if getSetCmd.Err() == redis.Nil {
+		return event.MkEventAdd("", 0), nil
+	} else if getSetCmd.Err() != nil {
 		return event.MkEventChg("", "", 0), err
 	}
 
-	// If the original value is nil, use event ADD
-	// TODO: impl
-	getSetCmd := cmds[0].(*redis.StringCmd)
-	if getSetCmd.Err() == redis.Nil {
-		return event.MkEventChg("", "", 0), getSetCmd.Err()
+	if ver > 0 {
+		return event.MkEventChg(value, value, ver), nil
 	}
-
 	incrCmd := cmds[1].(*redis.IntCmd)
 	newVer, err := incrCmd.Result()
 	if err != nil {
 		return event.MkEventChg("", "", 0), err
 	}
-	return event.MkEventChg(value, value, uint64(newVer)), nil
+	return event.MkEventChg(value, value, newVer), nil
 }
 
 func (p *WrappedRedis) BlockSetNX(ctx context.Context, key, value string) bool {

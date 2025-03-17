@@ -7,19 +7,19 @@ type event_t int
 var ErrUnchanged = errors.New("unchanged")
 
 const (
-	ADD event_t = iota // Key newly set
+	DEL event_t = iota // Key deleted
+	ADD                // Key newly set
 	CHG                // Key changed to a new value
-	DEL                // Key deleted
 )
 
 type Event struct {
-	Version  uint64 // internal event to merge a set of events
+	Version  int64 // internal event to merge a set of events
 	OldValue string
 	NewValue string
 	Type     event_t
 }
 
-func MkEventAdd(value string, ver uint64) Event {
+func MkEventAdd(value string, ver int64) Event {
 	return Event{
 		Version:  ver,
 		NewValue: value,
@@ -27,7 +27,7 @@ func MkEventAdd(value string, ver uint64) Event {
 	}
 }
 
-func MkEventChg(oldValue, newValue string, ver uint64) Event {
+func MkEventChg(oldValue, newValue string, ver int64) Event {
 	return Event{
 		Version:  ver,
 		OldValue: oldValue,
@@ -36,7 +36,7 @@ func MkEventChg(oldValue, newValue string, ver uint64) Event {
 	}
 }
 
-func MkEventDel(value string, ver uint64) Event {
+func MkEventDel(value string, ver int64) Event {
 	return Event{
 		Version:  ver,
 		OldValue: value,

@@ -2,6 +2,7 @@ package rrcc
 
 import (
 	"context"
+	"sync"
 	"time"
 	"unsafe"
 	"weak"
@@ -10,6 +11,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/humbornjo/rrcc/internal/btree"
+	"github.com/humbornjo/rrcc/internal/event"
 	"github.com/humbornjo/rrcc/internal/iredis"
 )
 
@@ -72,6 +74,7 @@ func (p *client) Data(key string, opts ...optionPoll) poller {
 		key:     key,
 		options: options,
 
+		_mu:     sync.RWMutex{},
 		_addr:   ptr,
 		_ctx:    cctx,
 		_cancel: func() { cancel() },
@@ -104,7 +107,7 @@ func (p *client) watch(ctx context.Context) {
 				for _, ew := range ews {
 					if pes := ew._addr.Value(); pes != nil {
 						ewsNew = append(ewsNew, ew)
-						go p.updateCache(ctx, ew, time.Now())
+						go p.updateCache(ctx, ew)
 					}
 				}
 				ews = ewsNew
@@ -113,59 +116,83 @@ func (p *client) watch(ctx context.Context) {
 	}()
 }
 
-func (p *client) update(key string, oldValue Event, upd Updater) (Event, error) {
-	// Try get events from cache first, if event version in cache is greater than the old one, return
-	if wk, ok := p.mcache.AtomicGet(key); ok {
-		if pes := wk.Value(); pes != nil {
-			if es := *pes; len(es) > 0 {
-				return oldValue.MergeEvents(es)
-			}
-		}
-	}
-
-	tctx, cancel := context.WithTimeout(p._ctx, 5*time.Second)
+func (p *client) update(key string, oldEvent Event, upd Updater) (Event, error) {
+	tctx, cancel := context.WithTimeout(p._ctx, 3*time.Second)
 	defer cancel()
 
-	// If the evnets in cache are not as up-to-date as the given one, search redis for the newest one
-	if newValue, err := p._iclient.Get(tctx, key); err == nil &&
-		newValue.Version > oldValue.Version {
-		return oldValue.MergeEvents([]Event{newValue})
-	}
-
-	// If no updator is provided, then return, omit the updating phase
-	if upd == nil {
-		return oldValue, nil
+	var ver int64
+	if newEvent, err := p._update(tctx, key, oldEvent); upd == nil {
+		if err != ErrRemoteOutOfDate {
+			return newEvent, err
+		}
+		ver = oldEvent.Version
+	} else {
+		if err == nil {
+			return newEvent, nil
+		}
 	}
 
 	// Recently event from redis is still not as up to date as the given one, try setNX, ready to update
 	if lockValue := uuid.New().String(); !p._iclient.BlockSetNX(tctx, key, lockValue) {
-		return oldValue, ErrRedisSetNX
+		return oldEvent, ErrRedisSetNX
 	} else {
 		defer p._iclient.MatchDelNX(tctx, key, lockValue)
 	}
 
 	// Set successfully, double check the event in redis to make sure it really need to be updated
-	if newValue, err := p._iclient.Get(tctx, key); err == nil &&
-		newValue.Version > oldValue.Version {
-		return oldValue.MergeEvents([]Event{newValue})
+	if newEvent, err := p._iclient.Get(tctx, key); err == nil {
+		if newEvent.Version > oldEvent.Version {
+			return oldEvent.MergeEvents([]Event{newEvent})
+		} else if newEvent.Version == oldEvent.Version {
+			if upd == nil {
+				return oldEvent.MergeEvents([]Event{newEvent})
+			}
+		} else {
+			upd = func() string { return oldEvent.NewValue }
+		}
 	}
 
 	// Generate the new value, making event and set it redis, INCR the version
-	if newValue, err := p._iclient.Set(tctx, key, upd()); err != nil {
-		return oldValue, err
-	} else {
-		return oldValue.MergeEvents([]Event{newValue})
+	newEvent, err := p._iclient.Set(tctx, key, upd(), ver)
+	if err != nil {
+		return oldEvent, err
 	}
+
+	return oldEvent.MergeEvents([]Event{newEvent})
 }
 
-// Event is updated every 10 seconds by default, if the order needs perfectly ensured, then we still need
-// a timestamp to record the sequence on client side. And, this timestamp should better be aligned among
-// all clients. Thus the perfect choice is nanosecond timestamp.
-func (p *client) updateCache(ctx context.Context, ew eventWatch, _ time.Time) {
+func (p *client) _update(ctx context.Context, key string, oldEvent Event) (Event, error) {
+	// Try get events from cache first, if event version in cache is greater than the old one, return
+	if wk, ok := p.mcache.AtomicGet(key); ok {
+		p.mcache.RLock()
+		if pes := wk.Value(); pes != nil && len(*pes) > 0 {
+			es := *pes
+			if es[len(es)-1].Version > oldEvent.Version {
+				p.mcache.RUnlock()
+				return oldEvent.MergeEvents(es)
+			}
+		}
+		p.mcache.RUnlock()
+	}
+
+	// If the evnets in cache are not as up-to-date as the given one, search redis for the newest one
+	if newEvent, err := p._iclient.Get(ctx, key); err == nil {
+		if newEvent.Version < oldEvent.Version {
+			return oldEvent, ErrRemoteOutOfDate
+		} else {
+			return oldEvent.MergeEvents([]Event{newEvent})
+		}
+	}
+
+	return oldEvent, event.ErrUnchanged
+}
+
+func (p *client) updateCache(ctx context.Context, ew eventWatch) {
 	e, err := p._iclient.Get(ctx, ew.key)
-	if err != nil {
+	if err != nil || e.Version < 1 {
 		return
 	}
+
 	p.mcache.AtomicPut(
 		ew.key,
 		func(oldV weak.Pointer[[]Event], exists bool) (weak.Pointer[[]Event], bool) {
@@ -176,6 +203,9 @@ func (p *client) updateCache(ctx context.Context, ew eventWatch, _ time.Time) {
 				panic("unreachable")
 			} else {
 				*pes = append(*pes, e)
+				if len(*pes) > 64 {
+					*pes = (*pes)[len(*pes)-64:]
+				}
 				return oldV, false
 			}
 		})
