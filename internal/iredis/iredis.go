@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/humbornjo/rrcc/internal/event"
@@ -54,15 +55,11 @@ func (p *WrappedRedis) Get(ctx context.Context, key string) (event.Event, error)
 	return event.MkEventChg(val, val, ver), nil
 }
 
-func (p *WrappedRedis) Set(ctx context.Context, key string, value string, ver int64) (event.Event, error) {
+func (p *WrappedRedis) Set(ctx context.Context, key string, value string) (event.Event, error) {
 	conn := p._getConn()
 	cmds, err := conn.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 		pipe.GetSet(ctx, p.keyData(key), value)
-		if ver > 0 {
-			pipe.Set(ctx, p.keyVersion(key), ver, 0)
-		} else {
-			pipe.Incr(ctx, p.keyVersion(key))
-		}
+		pipe.Incr(ctx, p.keyVersion(key))
 		return nil
 	})
 
@@ -72,13 +69,6 @@ func (p *WrappedRedis) Set(ctx context.Context, key string, value string, ver in
 		return event.MkEventChg("", "", 0), err
 	}
 
-	if ver > 0 {
-		err := cmds[1].(*redis.StatusCmd).Err()
-		if err != nil && err != redis.Nil {
-			return event.MkEventChg("", "", 0), err
-		}
-		return event.MkEventChg(value, value, ver), nil
-	}
 	incrCmd := cmds[1].(*redis.IntCmd)
 	newVer, err := incrCmd.Result()
 	if err != nil && err != redis.Nil {
@@ -88,24 +78,59 @@ func (p *WrappedRedis) Set(ctx context.Context, key string, value string, ver in
 	return event.MkEventChg(value, value, newVer), nil
 }
 
-func (p *WrappedRedis) BlockSetNX(ctx context.Context, key, value string) bool {
+// Update Version od Event with lua script, if Key not exist, just set it. If the current value
+// equals the new value, do nothing, if current Version is greater than the new value return a error.
+// Otherwise set the new value.
+func (p *WrappedRedis) SetVer(ctx context.Context, key string, ver int64) error {
+	redisClient := p._getConn()
+	script := `
+        local current_ver = redis.call('GET', KEYS[1])
+        if not current_ver then
+            redis.call('SET', KEYS[1], ARGV[1])
+            return 0
+        end
+        local current_num = tonumber(current_ver)
+        if not current_num then
+            return {err="current version is not a number"}
+        end
+        local new_num = tonumber(ARGV[1])
+        if not new_num then
+            return {err="new version is not a number"}
+        end
+        if current_num == new_num then
+            return 0
+        elseif current_num > new_num then
+            return {err="current version is greater than new version"}
+        else
+            redis.call('SET', KEYS[1], ARGV[1])
+            return 0
+        end
+    `
+	_, err := redisClient.Eval(ctx, script, []string{key}, ver).Result()
+	return err
+}
+
+func (p *WrappedRedis) BlockSetNX(ctx context.Context, key string, due time.Time) (string, bool) {
 	conn := p._getConn()
-	expiration := 5 * time.Second
+	value := uuid.New().String()
 	retryInterval := 100 * time.Millisecond // Retry every 100ms
 
 	for {
 		select {
 		case <-ctx.Done():
-			return false
+			return "", false
 		default:
+			expiration := time.Until(due)
+			if expiration <= 0 {
+				return "", false
+			}
 			cmd := conn.SetNX(ctx, p.keyLock(key), value, expiration)
 			if cmd.Err() != nil {
 				time.Sleep(retryInterval)
 				continue
 			}
 			if cmd.Val() {
-				// Lock acquired successfully
-				return true
+				return value, true
 			}
 			time.Sleep(retryInterval)
 		}

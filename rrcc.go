@@ -9,32 +9,24 @@ import (
 )
 
 const (
-	ADD = event.ADD
-	CHG = event.CHG
-	DEL = event.DEL
+	ADD  = event.ADD  // Key is updated to a exact value from nil
+	CHG  = event.CHG  // Key changed to a new value from a previous value
+	DEL  = event.DEL  // Key is either deleted or expired
+	PING = event.PING // Key is still alive
 )
 
 type Event = event.Event
 
-type Client interface {
-	Stop()
-	Data(string, ...optionPoll) poller
-	// Bind(string, any, ...optionPoll) poller
-
-	watch(context.Context)
-	update(string, event.Event, func() string) (Event, error)
-}
-
-func FromOptions(ctx context.Context, options redis.Options, opts ...optionClient) (Client, error) {
+func FromOptions(ctx context.Context, options redis.Options, opts ...optionClient) (*hub, error) {
 	redisClient := redis.NewClient(&options)
-	return clientInit(ctx, func() *redis.Client { return redisClient })
+	return initHub(ctx, func() *redis.Client { return redisClient })
 }
 
-func FromGetConn(ctx context.Context, fn func() *redis.Client, opts ...optionClient) (Client, error) {
+func FromGetConn(ctx context.Context, fn func() *redis.Client, opts ...optionClient) (*hub, error) {
 	if fn() == nil {
 		return nil, ErrNilConn
 	}
-	return clientInit(ctx, fn)
+	return initHub(ctx, fn)
 }
 
 type optionsClient struct {
