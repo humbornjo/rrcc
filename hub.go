@@ -51,7 +51,7 @@ func initHub(ctx context.Context, fn func() *redis.Client) (*hub, error) {
 		return nil, err
 	}
 
-	defer client.start()
+	go client.start()
 	return client, nil
 }
 
@@ -101,27 +101,25 @@ func (p *hub) Bind(k string, s any, opts ...PollOption) poller {
 }
 
 func (p *hub) start() {
-	go func() {
-		for {
-			select {
-			case <-p._ctx.Done():
-				p._cancel()
-				return
-			case handler := <-p._handlerCh:
-				p._mu.Lock()
-				ctx, cancel := context.WithCancel(context.Background())
-				if _, ok := p.hcache[handler.key]; !ok {
-					waker := make(chan struct{})
-					p.hcache[handler.key] = &hubEntry{_wakerCh: waker}
-					go p.startKey(handler.key, waker, ctx.Done())
-				}
-				handlers := p.hcache[handler.key]._handlers
-				p.hcache[handler.key]._handlers = append(handlers, handler)
-				cancel()
-				p._mu.Unlock()
+	for {
+		select {
+		case <-p._ctx.Done():
+			p._cancel()
+			return
+		case handler := <-p._handlerCh:
+			p._mu.Lock()
+			ctx, cancel := context.WithCancel(context.Background())
+			if _, ok := p.hcache[handler.key]; !ok {
+				waker := make(chan struct{})
+				p.hcache[handler.key] = &hubEntry{_wakerCh: waker}
+				go p.startKey(handler.key, waker, ctx.Done())
 			}
+			handlers := p.hcache[handler.key]._handlers
+			p.hcache[handler.key]._handlers = append(handlers, handler)
+			cancel()
+			p._mu.Unlock()
 		}
-	}()
+	}
 }
 
 func (p *hub) startKey(key string, waker <-chan struct{}, blocker <-chan struct{}) {
