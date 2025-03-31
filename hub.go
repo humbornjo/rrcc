@@ -9,8 +9,8 @@ import (
 
 	. "github.com/humbornjo/vino"
 	"github.com/redis/go-redis/v9"
+	"modernc.org/b/v2"
 
-	"github.com/humbornjo/rrcc/internal/btree"
 	"github.com/humbornjo/rrcc/internal/iredis"
 )
 
@@ -28,25 +28,48 @@ type hubEntry struct {
 
 type hub struct {
 	hcache map[string]*hubEntry
-	mcache btree.Btree[string, weak.Pointer[[]Event]]
+	mcache *b.Tree[string, weak.Pointer[[]Event]]
 
 	mu        MutexRW
 	ctx       context.Context
 	cancel    context.CancelFunc
 	iclient   iredis.WrappedRedis
 	handlerCh chan pollerHandler
+
+	maxCacheSize  int
+	watchInterval time.Duration
+	updateTimeout time.Duration
 }
 
-func initHub(ctx context.Context, fn func() *redis.Client) (*hub, error) {
+func initHub(ctx context.Context, fn func() *redis.Client, opts ...hubOption) (*hub, error) {
+	config := defaultHubConfig()
+	for _, opt := range opts {
+		opt(&config)
+	}
+
+	cmp := func(s1, s2 string) int {
+		if s1 > s2 {
+			return 1
+		} else if s1 == s2 {
+			return 0
+		} else {
+			return 1
+		}
+	}
+
 	cctx, cancel := context.WithCancel(ctx)
 	client := &hub{
 		hcache: make(map[string]*hubEntry),
-		mcache: btree.NewBtree[string, weak.Pointer[[]Event]](btree.CmpString),
+		mcache: b.TreeNew[string, weak.Pointer[[]Event]](cmp),
 
 		ctx:       cctx,
 		cancel:    cancel,
-		iclient:   *iredis.NewIredis(fn),
+		iclient:   *iredis.NewIredis(fn, config.prefix),
 		handlerCh: make(chan pollerHandler, 32),
+
+		maxCacheSize:  config.maxCacheSize,
+		watchInterval: config.watchInterval,
+		updateTimeout: config.updateTimeout,
 	}
 
 	if err := fn().Ping(ctx).Err(); err != nil {
@@ -67,19 +90,20 @@ func (p *hub) Data(key string, opts ...PollOption) poller {
 	updateCh := make(chan Event, 1)
 	cctx, cancel := context.WithCancel(p.ctx)
 	poller := &basePoller{
-		key:           key,
-		keepAlive:     config.keepAlive,
-		recvHeartbeat: config.recvHeartbeat,
+		key:        key,
+		keepAlive:  config.keepAlive,
+		bufferSize: config.bufferSize,
 
 		addr:             ptr,
 		ctx:              cctx,
 		cancel:           cancel,
 		updateCh:         updateCh,
-		onWatchCloseHook: config._onWatchCloseHook,
+		onWatchCloseHook: config.onWatchCloseHook,
 	}
 
-	p.mcache.AtomicPut(
-		key,
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.mcache.Put(key,
 		func(old weak.Pointer[[]Event], exists bool) (weak.Pointer[[]Event], bool) {
 			if new := old.Value(); exists && new != nil {
 				ptr = unsafe.Pointer(new)
@@ -107,7 +131,6 @@ func (p *hub) start() {
 	for {
 		select {
 		case <-p.ctx.Done():
-			p.cancel()
 			return
 		case handler := <-p.handlerCh:
 			p.mu.Lock()
@@ -127,8 +150,7 @@ func (p *hub) start() {
 
 func (p *hub) startKey(key string, waker <-chan struct{}, blocker <-chan struct{}) {
 	<-blocker
-	// TODO: make ticker interval configurable
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := time.NewTicker(p.watchInterval)
 	for {
 		var e *Event
 		select {
@@ -142,14 +164,16 @@ func (p *hub) startKey(key string, waker <-chan struct{}, blocker <-chan struct{
 			e = p.updateCache(p.ctx, key, nil)
 		}
 
-		p.mu.RLock()
+		p.mu.Lock()
+		defer p.mu.Unlock()
 		if len(p.hcache[key].handlers) == 0 {
-			p.mu.RUnlock()
+			delete(p.hcache, key)
+			_ = p.mcache.Delete(key)
 			return
 		}
 
 		if e != nil {
-			p.mcache.AtomicPut(key, func(old weak.Pointer[[]Event], exists bool) (weak.Pointer[[]Event], bool) {
+			p.mcache.Put(key, func(old weak.Pointer[[]Event], exists bool) (weak.Pointer[[]Event], bool) {
 				if !exists {
 					return old, false
 				}
@@ -174,14 +198,12 @@ func (p *hub) startKey(key string, waker <-chan struct{}, blocker <-chan struct{
 				handlers = append(handlers, h)
 			}
 		}
-		p.mu.RLifted()
 		p.hcache[key].handlers = handlers
-		p.mu.Unlock()
 	}
 }
 
 func (p *hub) Update(key string, upd Updater, expiration time.Duration) error {
-	ctx, cancel := context.WithTimeout(p.ctx, 5*time.Second)
+	ctx, cancel := context.WithTimeout(p.ctx, p.updateTimeout)
 	defer cancel()
 	if e := p.updateCache(ctx, key, nil); e != nil {
 		// Remote already has newer event
@@ -226,7 +248,7 @@ func (p *hub) Update(key string, upd Updater, expiration time.Duration) error {
 // Update cache event for key, if the remote event is newer than the latest local
 // event return the event. Otherwise return nil. If remote event's version is smaller
 // OR same version but different value, emit a routine to update the remote version
-// to [LOCAL_VERSIOn + 1] via lua script.
+// to [LOCAL_VERSION + 1] via lua script.
 func (p *hub) updateCache(ctx context.Context, key string, event *Event) *Event {
 	hasUpdate := false
 	defer func() {
@@ -272,13 +294,15 @@ func (p *hub) updateCache(ctx context.Context, key string, event *Event) *Event 
 		}
 		newEvent.Version = ver
 		p.mu.Lock()
-		oldEvent = p.hcache[key].lrEvent
-		if oldEvent.Version < newEvent.Version ||
-			oldEvent.Version == newEvent.Version && oldEvent.NewValue != newEvent.NewValue {
-			hasUpdate = true
-			p.hcache[key].lrEvent = newEvent
-			p.mu.Unlock()
-			return &newEvent
+		if entry, ok := p.hcache[key]; ok {
+			oldEvent = entry.lrEvent
+			if oldEvent.Version < newEvent.Version ||
+				oldEvent.Version == newEvent.Version && oldEvent.NewValue != newEvent.NewValue {
+				hasUpdate = true
+				p.hcache[key].lrEvent = newEvent
+				p.mu.Unlock()
+				return &newEvent
+			}
 		}
 		p.mu.Unlock()
 	}
@@ -286,13 +310,18 @@ func (p *hub) updateCache(ctx context.Context, key string, event *Event) *Event 
 	if oldEvent.Version < newEvent.Version ||
 		oldEvent.Version == newEvent.Version && oldEvent.NewValue != newEvent.NewValue {
 		p.mu.RLifted()
-		hasUpdate = true
-		p.hcache[key].lrEvent = newEvent
-		p.mu.Unlock()
+		defer p.mu.Unlock()
+		if _, ok := p.hcache[key]; ok {
+			p.hcache[key].lrEvent = newEvent
+			hasUpdate = true
+			p.mu.Unlock()
+		}
 		return &newEvent
 	}
-	defer p.mu.RUnlock()
-	p.mcache.AtomicPut(
+
+	p.mu.RLifted()
+	defer p.mu.Unlock()
+	p.mcache.Put(
 		key,
 		func(oldV weak.Pointer[[]Event], exists bool) (weak.Pointer[[]Event], bool) {
 			if !exists {
@@ -302,8 +331,8 @@ func (p *hub) updateCache(ctx context.Context, key string, event *Event) *Event 
 				panic("unreachable")
 			} else {
 				*pes = append(*pes, newEvent)
-				if len(*pes) > 64 {
-					*pes = (*pes)[len(*pes)-64:]
+				if len(*pes) > p.maxCacheSize {
+					*pes = (*pes)[1:]
 				}
 				return oldV, false
 			}

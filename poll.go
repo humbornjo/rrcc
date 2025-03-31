@@ -10,10 +10,10 @@ import (
 type Updater = func() (string, error)
 
 var defaultPollConfig = pollConfig{
-	keepAlive:     1 * time.Hour,
-	recvHeartbeat: false,
+	keepAlive:  1 * time.Hour,
+	bufferSize: 64,
 
-	_onWatchCloseHook: func(p poller) { p.Cancel() },
+	onWatchCloseHook: func(p poller) { p.Cancel() },
 }
 
 type poller interface {
@@ -23,10 +23,10 @@ type poller interface {
 }
 
 type basePoller struct {
-	key           string
-	closed        bool
-	keepAlive     time.Duration
-	recvHeartbeat bool
+	key        string
+	closed     bool
+	keepAlive  time.Duration
+	bufferSize int
 
 	mu               sync.Mutex
 	addr             unsafe.Pointer
@@ -67,19 +67,13 @@ func (p *basePoller) poll() <-chan Event {
 }
 
 func (p *basePoller) watchUpdate() <-chan Event {
-	ch := make(chan Event, 32)
+	ch := make(chan Event, p.bufferSize)
 	go func() {
 		defer p.onWatchCloseHook(p)
 		for {
 			select {
 			case e := <-p.poll():
-				if p.recvHeartbeat {
-					ch <- e
-					continue
-				}
-				if e.Type != PING {
-					ch <- e
-				}
+				ch <- e
 			case <-p.ctx.Done():
 				return
 			case <-time.After(p.keepAlive):
@@ -98,21 +92,26 @@ type structPoller struct {
 type PollOption func(*pollConfig)
 
 type pollConfig struct {
-	keepAlive     time.Duration
-	recvHeartbeat bool
-
-	_onWatchCloseHook func(poller)
+	keepAlive        time.Duration
+	bufferSize       int
+	onWatchCloseHook func(poller)
 }
 
 func WithOnCloseHook(onClose func(poller)) PollOption {
 	return func(config *pollConfig) {
-		config._onWatchCloseHook = onClose
+		config.onWatchCloseHook = onClose
 	}
 }
 
 func WithKeepalive(keepalive time.Duration) PollOption {
 	return func(config *pollConfig) {
 		config.keepAlive = keepalive
+	}
+}
+
+func WithMsgBufferSize(size int) PollOption {
+	return func(config *pollConfig) {
+		config.bufferSize = size
 	}
 }
 

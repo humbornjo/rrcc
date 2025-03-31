@@ -14,18 +14,18 @@ import (
 type WrappedRedis struct {
 	prefix string
 
-	_getConn func() *redis.Client
+	getConn func() *redis.Client
 }
 
 func NewIredis(fn func() *redis.Client, prefix ...string) *WrappedRedis {
 	if len(prefix) == 0 || prefix[0] == "" {
-		return &WrappedRedis{_getConn: fn, prefix: "rrcc"}
+		return &WrappedRedis{getConn: fn, prefix: "rrcc"}
 	}
-	return &WrappedRedis{_getConn: fn, prefix: prefix[0]}
+	return &WrappedRedis{getConn: fn, prefix: prefix[0]}
 }
 
 func (p *WrappedRedis) Get(ctx context.Context, key string) (event.Event, error) {
-	conn := p._getConn()
+	conn := p.getConn()
 	cmds, err := conn.Pipelined(ctx, func(pipe redis.Pipeliner) error {
 		pipe.Get(ctx, p.keyData(key))
 		pipe.Get(ctx, p.keyVersion(key))
@@ -56,7 +56,7 @@ func (p *WrappedRedis) Get(ctx context.Context, key string) (event.Event, error)
 }
 
 func (p *WrappedRedis) Set(ctx context.Context, key string, value string) (event.Event, error) {
-	conn := p._getConn()
+	conn := p.getConn()
 	cmds, err := conn.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 		pipe.GetSet(ctx, p.keyData(key), value)
 		pipe.Incr(ctx, p.keyVersion(key))
@@ -82,7 +82,7 @@ func (p *WrappedRedis) Set(ctx context.Context, key string, value string) (event
 // equals the new value, do nothing, if current Version is greater than the new value return a error.
 // Otherwise set the new value.
 func (p *WrappedRedis) SetVer(ctx context.Context, key string, ver int64) error {
-	redisClient := p._getConn()
+	redisClient := p.getConn()
 	script := `
         local current_ver = redis.call('GET', KEYS[1])
         if not current_ver then
@@ -111,7 +111,7 @@ func (p *WrappedRedis) SetVer(ctx context.Context, key string, ver int64) error 
 }
 
 func (p *WrappedRedis) BlockSetNX(ctx context.Context, key string, due time.Time) (string, bool) {
-	conn := p._getConn()
+	conn := p.getConn()
 	value := uuid.New().String()
 	retryInterval := 100 * time.Millisecond // Retry every 100ms
 
@@ -146,6 +146,6 @@ func (p *WrappedRedis) MatchDelNX(ctx context.Context, key, value string) error 
             return 0
         end
     `)
-	_, err := script.Run(ctx, p._getConn(), []string{p.keyLock(key)}, value).Result()
+	_, err := script.Run(ctx, p.getConn(), []string{p.keyLock(key)}, value).Result()
 	return err
 }

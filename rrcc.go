@@ -2,6 +2,7 @@ package rrcc
 
 import (
 	"context"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 
@@ -17,23 +18,56 @@ const (
 
 type Event = event.Event
 
-func FromOptions(ctx context.Context, options redis.Options, opts ...optionClient) (*hub, error) {
+func FromOptions(ctx context.Context, options redis.Options, opts ...hubOption) (*hub, error) {
 	redisClient := redis.NewClient(&options)
-	return initHub(ctx, func() *redis.Client { return redisClient })
+	return initHub(ctx, func() *redis.Client { return redisClient }, opts...)
 }
 
-func FromGetConn(ctx context.Context, fn func() *redis.Client, opts ...optionClient) (*hub, error) {
+func FromGetConn(ctx context.Context, fn func() *redis.Client, opts ...hubOption) (*hub, error) {
 	if fn() == nil {
 		return nil, ErrNilConn
 	}
-	return initHub(ctx, fn)
+	return initHub(ctx, fn, opts...)
 }
 
-type optionsClient struct {
-	prefix string
+type hubConfig struct {
+	prefix        string
+	maxCacheSize  int
+	watchInterval time.Duration
+	updateTimeout time.Duration
 }
-type optionClient func(*optionsClient)
 
-var defaultOptionsClient = optionsClient{
-	prefix: "rrcc",
+type hubOption func(*hubConfig)
+
+func defaultHubConfig() hubConfig {
+	return hubConfig{
+		prefix:        "rrcc",
+		maxCacheSize:  64,
+		updateTimeout: 5 * time.Second,
+		watchInterval: 10 * time.Second,
+	}
+}
+
+func WithRedisKeyPrefix(prefix string) hubOption {
+	return func(cfg *hubConfig) {
+		cfg.prefix = prefix
+	}
+}
+
+func WithUpdateTimeout(timeout time.Duration) hubOption {
+	return func(cfg *hubConfig) {
+		cfg.updateTimeout = timeout
+	}
+}
+
+func WithWatchInterval(interval time.Duration) hubOption {
+	return func(cfg *hubConfig) {
+		cfg.watchInterval = interval
+	}
+}
+
+func WithMaxCacheSize(size int) hubOption {
+	return func(cfg *hubConfig) {
+		cfg.maxCacheSize = size
+	}
 }
