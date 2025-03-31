@@ -1,4 +1,4 @@
-package rrcc
+package rrcc_test
 
 import (
 	"context"
@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis"
+	"github.com/humbornjo/rrcc"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 )
@@ -29,7 +30,7 @@ func TestMain(m *testing.M) {
 }
 
 func TestSimple(t *testing.T) {
-	rcc, _ := FromGetConn(
+	rcc, _ := rrcc.FromGetConn(
 		context.Background(),
 		func() *redis.Client { return redisCli },
 	)
@@ -39,11 +40,11 @@ func TestSimple(t *testing.T) {
 	key := "TEST_KEY"
 	wg := sync.WaitGroup{}
 	poller := rcc.Data(key)
-	poller.Watch(func(e Event) {
+	poller.Watch(func(e rrcc.Event) {
 		switch e.Type {
-		case DEL:
+		case rrcc.DEL:
 		// handle delete Event
-		case ADD, CHG, PING:
+		case rrcc.ADD, rrcc.CHG, rrcc.PING:
 			if e.NewValue != value {
 				value = e.NewValue
 				wg.Done()

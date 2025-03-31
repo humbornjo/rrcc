@@ -122,11 +122,6 @@ func (p *hub) Stop() {
 	p.cancel()
 }
 
-// TODO: impl
-func (p *hub) Bind(k string, s any, opts ...PollOption) poller {
-	return p.Data(k, opts...)
-}
-
 func (p *hub) start() {
 	for {
 		select {
@@ -309,7 +304,7 @@ func (p *hub) updateCache(ctx context.Context, key string, event *Event) *Event 
 
 	if oldEvent.Version < newEvent.Version ||
 		oldEvent.Version == newEvent.Version && oldEvent.NewValue != newEvent.NewValue {
-		p.mu.RLifted()
+		p.mu.Rpgrade()
 		defer p.mu.Unlock()
 		if _, ok := p.hcache[key]; ok {
 			p.hcache[key].lrEvent = newEvent
@@ -319,7 +314,7 @@ func (p *hub) updateCache(ctx context.Context, key string, event *Event) *Event 
 		return &newEvent
 	}
 
-	p.mu.RLifted()
+	p.mu.Rpgrade()
 	defer p.mu.Unlock()
 	p.mcache.Put(
 		key,

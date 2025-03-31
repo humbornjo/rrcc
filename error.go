@@ -5,11 +5,11 @@ import "errors"
 // Exposed errors
 var (
 	// redis error
-	ErrNilConn    = errors.New("Redis connection nil")
-	ErrRedisSetNX = errors.New("Redis SETNX failed")
+	ErrNilConn    = errors.New("redis nil connection")
+	ErrRedisSetNX = errors.New("redis SETNX failed")
 
 	// rrcc error
-	ErrNegTime         = errors.New("Invalid negative duration")
-	ErrStopWatch       = errors.New("Poller already stopped watching")
-	ErrRemoteOutOfDate = errors.New("Remote config out-of-date")
+	ErrNegTime         = errors.New("negative duration")
+	ErrStopWatch       = errors.New("poller not watching")
+	ErrRemoteOutOfDate = errors.New("remote config out-of-date")
 )

@@ -84,11 +84,6 @@ func (p *basePoller) watchUpdate() <-chan Event {
 	return ch
 }
 
-type structPoller struct {
-	s any
-	basePoller
-}
-
 type PollOption func(*pollConfig)
 
 type pollConfig struct {
