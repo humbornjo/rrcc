@@ -16,6 +16,10 @@ github.com/gomodule/redigo v1.9.2 h1:HrutZBLhSIU8abiSfW8pj8mPhOyMYjZT/wcA4/L9L9s
 github.com/gomodule/redigo v1.9.2/go.mod h1:KsU3hiK/Ay8U42qpaJk+kuNa3C+spxapWpM+ywhcgtw=
 github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
 github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
+github.com/humbornjo/vino v0.0.0-20250320125528-e690f31cfe43 h1:2d+bab4lZOQVP1okIHRSbfFonXtuHB/0h6BT6v9jFo4=
+github.com/humbornjo/vino v0.0.0-20250320125528-e690f31cfe43/go.mod h1:6Bz40TPbwkHKpuVS08uECRhQH4rXw0fp0/xYmTHV6M8=
+github.com/humbornjo/vino v0.0.0-20250330171907-5317ad00b93d h1:wl+MNqXmMMYqvZMOlgVKIZLS8Y8Fnzgg2ucfFNy4ERE=
+github.com/humbornjo/vino v0.0.0-20250330171907-5317ad00b93d/go.mod h1:6Z/fjF22AlC4jvmXslNnoNxh0BdpNXOMx8BDKcl1X58=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/redis/go-redis/v9 v9.7.1 h1:4LhKRCIduqXqtvCUlaq9c8bdHOkICjDMrr1+Zb3osAc=

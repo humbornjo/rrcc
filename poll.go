@@ -2,119 +2,84 @@ package rrcc
 
 import (
 	"context"
-	"errors"
-	"fmt"
-	"log/slog"
 	"sync"
 	"time"
 	"unsafe"
-
-	"github.com/humbornjo/rrcc/internal/event"
 )
 
-type Updater = func() string
+type Updater = func() (string, error)
 
-var defaultOptionsPoll = optionsPoll{
-	interval:         5,
-	enableEncryption: false,
+var defaultPollConfig = pollConfig{
+	keepAlive:  1 * time.Hour,
+	bufferSize: 64,
 
-	_create: nil,
-	_jitter: func(interval int) int { return interval },
-	_onFailHook: func(p poller, err error) {
-		slog.Error(fmt.Sprintf("poller on key %s failed", p.Key()), "err", err)
-	},
-	_onCloseHook: func(p poller, err error) {
-		slog.Error(fmt.Sprintf("poller on key %s closed", p.Key()), "err", err)
-	},
+	onWatchCloseHook: func(p poller) { p.Cancel() },
 }
 
 type poller interface {
-	Cancel()
 	Key() string
 	Watch(func(Event))
-	Update(Updater) (Event, error)
+	Cancel()
 }
 
 type basePoller struct {
-	key     string
-	latest  Event
-	options optionsPoll
+	key        string
+	closed     bool
+	keepAlive  time.Duration
+	bufferSize int
 
-	_mu     sync.RWMutex
-	_addr   unsafe.Pointer
-	_ctx    context.Context
-	_cancel func()
-	_update func(string, Event, Updater) (Event, error)
+	mu               sync.Mutex
+	addr             unsafe.Pointer
+	ctx              context.Context
+	cancel           context.CancelFunc
+	updateCh         chan Event
+	onWatchCloseHook func(p poller)
 }
 
 func (p *basePoller) Key() string {
 	return p.key
 }
 
-func (p *basePoller) Watch(cb func(Event)) {
+func (p *basePoller) Watch(callback func(Event)) {
 	ch := p.watchUpdate()
 	go func() {
 		for {
-			select {
-			case event, ok := <-ch:
-				if ok {
-					cb(event)
-				} else {
-					return
-				}
+			event, ok := <-ch
+			if !ok {
+				return
 			}
+			callback(event)
 		}
 	}()
 }
 
 func (p *basePoller) Cancel() {
-	p._addr = nil
-	p._cancel()
+	p.cancel()
+	p.addr = nil
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	close(p.updateCh)
+	p.closed = true
 }
 
-func (p *basePoller) Update(fn Updater) (Event, error) {
-	p._mu.RLock()
-	e := p.latest
-	p._mu.RUnlock()
-	return p._update(p.key, e, fn)
-}
-
-func (p *basePoller) poll() (Event, error) {
-	p._mu.RLock()
-	e := p.latest
-	p._mu.RUnlock()
-	return p._update(p.key, e, nil)
+func (p *basePoller) poll() <-chan Event {
+	return p.updateCh
 }
 
 func (p *basePoller) watchUpdate() <-chan Event {
-	ch := make(chan Event, 32)
+	ch := make(chan Event, p.bufferSize)
 	go func() {
+		defer p.onWatchCloseHook(p)
 		for {
 			select {
-			case <-p._ctx.Done():
-				goto exit
-			default:
-				e, err := p.poll()
-				p._mu.Lock()
-				p.latest = e
-				p._mu.Unlock()
-				if err != nil {
-					if !errors.Is(err, event.ErrUnchanged) {
-						p.options._onFailHook(p, err)
-					}
-				} else {
-					ch <- e
-				}
-				if t := p.options._jitter(p.options.interval); t <= 0 {
-					p.options._onFailHook(p, ErrNegTime)
-				} else {
-					time.Sleep(time.Duration(t) * time.Second)
-				}
+			case e := <-p.poll():
+				ch <- e
+			case <-p.ctx.Done():
+				return
+			case <-time.After(p.keepAlive):
+				return
 			}
 		}
-	exit:
-		close(ch)
-		p.options._onCloseHook(p, ErrStopWatch)
 	}()
 	return ch
 }
@@ -124,53 +89,48 @@ type structPoller struct {
 	basePoller
 }
 
-type optionPoll func(*optionsPoll)
+type PollOption func(*pollConfig)
 
-type optionsPoll struct {
-	enableEncryption bool
-	interval         int
-
-	_create      *string
-	_jitter      func(interval int) int
-	_onFailHook  func(poller, error)
-	_onCloseHook func(poller, error)
+type pollConfig struct {
+	keepAlive        time.Duration
+	bufferSize       int
+	onWatchCloseHook func(poller)
 }
 
-func WithDefaultValue(value string) optionPoll {
-	return func(opts *optionsPoll) {
-		if value == "" {
-			return
+func WithOnCloseHook(onClose func(poller)) PollOption {
+	return func(config *pollConfig) {
+		config.onWatchCloseHook = onClose
+	}
+}
+
+func WithKeepalive(keepalive time.Duration) PollOption {
+	return func(config *pollConfig) {
+		config.keepAlive = keepalive
+	}
+}
+
+func WithMsgBufferSize(size int) PollOption {
+	return func(config *pollConfig) {
+		config.bufferSize = size
+	}
+}
+
+func signalFunc(poller *basePoller) func(*Event) bool {
+	return func(e *Event) bool {
+		poller.mu.Lock()
+		defer poller.mu.Unlock()
+		if poller.closed {
+			return false
 		}
-		opts._create = &value
-	}
-}
 
-func WithInterval(interval int) optionPoll {
-	return func(opts *optionsPoll) {
-		opts.interval = interval
-	}
-}
+		if e == nil {
+			return true
+		}
 
-func WithJitter(jitter func(interval int) int) optionPoll {
-	return func(opts *optionsPoll) {
-		opts._jitter = jitter
-	}
-}
-
-func WithOnCloseHook(onClose func(poller, error)) optionPoll {
-	return func(opts *optionsPoll) {
-		opts._onCloseHook = onClose
-	}
-}
-
-func WithOnFailHook(onFail func(poller, error)) optionPoll {
-	return func(opts *optionsPoll) {
-		opts._onFailHook = onFail
-	}
-}
-
-func WithEncryption(enable bool) optionPoll {
-	return func(opts *optionsPoll) {
-		opts.enableEncryption = enable
+		select {
+		case poller.updateCh <- *e:
+		default:
+		}
+		return true
 	}
 }

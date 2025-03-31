@@ -2,6 +2,7 @@ package rrcc
 
 import (
 	"context"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 
@@ -9,39 +10,64 @@ import (
 )
 
 const (
-	ADD = event.ADD
-	CHG = event.CHG
-	DEL = event.DEL
+	ADD  = event.ADD  // Key is updated to a exact value from nil
+	CHG  = event.CHG  // Key changed to a new value from a previous value
+	DEL  = event.DEL  // Key is either deleted or expired
+	PING = event.PING // Key is still alive
 )
 
 type Event = event.Event
 
-type Client interface {
-	Stop()
-	Data(string, ...optionPoll) poller
-	// Bind(string, any, ...optionPoll) poller
-
-	watch(context.Context)
-	update(string, event.Event, func() string) (Event, error)
-}
-
-func FromOptions(ctx context.Context, options redis.Options, opts ...optionClient) (Client, error) {
+func FromOptions(ctx context.Context, options redis.Options, opts ...hubOption) (*hub, error) {
 	redisClient := redis.NewClient(&options)
-	return clientInit(ctx, func() *redis.Client { return redisClient })
+	return initHub(ctx, func() *redis.Client { return redisClient }, opts...)
 }
 
-func FromGetConn(ctx context.Context, fn func() *redis.Client, opts ...optionClient) (Client, error) {
+func FromGetConn(ctx context.Context, fn func() *redis.Client, opts ...hubOption) (*hub, error) {
 	if fn() == nil {
 		return nil, ErrNilConn
 	}
-	return clientInit(ctx, fn)
+	return initHub(ctx, fn, opts...)
 }
 
-type optionsClient struct {
-	prefix string
+type hubConfig struct {
+	prefix        string
+	maxCacheSize  int
+	watchInterval time.Duration
+	updateTimeout time.Duration
 }
-type optionClient func(*optionsClient)
 
-var defaultOptionsClient = optionsClient{
-	prefix: "rrcc",
+type hubOption func(*hubConfig)
+
+func defaultHubConfig() hubConfig {
+	return hubConfig{
+		prefix:        "rrcc",
+		maxCacheSize:  64,
+		updateTimeout: 5 * time.Second,
+		watchInterval: 10 * time.Second,
+	}
+}
+
+func WithRedisKeyPrefix(prefix string) hubOption {
+	return func(cfg *hubConfig) {
+		cfg.prefix = prefix
+	}
+}
+
+func WithUpdateTimeout(timeout time.Duration) hubOption {
+	return func(cfg *hubConfig) {
+		cfg.updateTimeout = timeout
+	}
+}
+
+func WithWatchInterval(interval time.Duration) hubOption {
+	return func(cfg *hubConfig) {
+		cfg.watchInterval = interval
+	}
+}
+
+func WithMaxCacheSize(size int) hubOption {
+	return func(cfg *hubConfig) {
+		cfg.maxCacheSize = size
+	}
 }
