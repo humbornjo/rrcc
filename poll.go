@@ -28,12 +28,12 @@ type basePoller struct {
 	keepAlive     time.Duration
 	recvHeartbeat bool
 
-	_mu               sync.Mutex
-	_addr             unsafe.Pointer
-	_ctx              context.Context
-	_cancel           context.CancelFunc
-	_updateCh         chan Event
-	_onWatchCloseHook func(p poller)
+	mu               sync.Mutex
+	addr             unsafe.Pointer
+	ctx              context.Context
+	cancel           context.CancelFunc
+	updateCh         chan Event
+	onWatchCloseHook func(p poller)
 }
 
 func (p *basePoller) Key() string {
@@ -54,22 +54,22 @@ func (p *basePoller) Watch(callback func(Event)) {
 }
 
 func (p *basePoller) Cancel() {
-	p._cancel()
-	p._addr = nil
-	p._mu.Lock()
-	defer p._mu.Unlock()
-	close(p._updateCh)
+	p.cancel()
+	p.addr = nil
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	close(p.updateCh)
 	p.closed = true
 }
 
 func (p *basePoller) poll() <-chan Event {
-	return p._updateCh
+	return p.updateCh
 }
 
 func (p *basePoller) watchUpdate() <-chan Event {
 	ch := make(chan Event, 32)
 	go func() {
-		defer p._onWatchCloseHook(p)
+		defer p.onWatchCloseHook(p)
 		for {
 			select {
 			case e := <-p.poll():
@@ -80,7 +80,7 @@ func (p *basePoller) watchUpdate() <-chan Event {
 				if e.Type != PING {
 					ch <- e
 				}
-			case <-p._ctx.Done():
+			case <-p.ctx.Done():
 				return
 			case <-time.After(p.keepAlive):
 				return
@@ -116,10 +116,10 @@ func WithKeepalive(keepalive time.Duration) PollOption {
 	}
 }
 
-func signalfunc(poller *basePoller) func(*Event) bool {
+func signalFunc(poller *basePoller) func(*Event) bool {
 	return func(e *Event) bool {
-		poller._mu.Lock()
-		defer poller._mu.Unlock()
+		poller.mu.Lock()
+		defer poller.mu.Unlock()
 		if poller.closed {
 			return false
 		}
@@ -129,7 +129,7 @@ func signalfunc(poller *basePoller) func(*Event) bool {
 		}
 
 		select {
-		case poller._updateCh <- *e:
+		case poller.updateCh <- *e:
 		default:
 		}
 		return true

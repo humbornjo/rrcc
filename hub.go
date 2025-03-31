@@ -7,7 +7,7 @@ import (
 	"unsafe"
 	"weak"
 
-	"github.com/humbornjo/vino"
+	. "github.com/humbornjo/vino"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/humbornjo/rrcc/internal/btree"
@@ -15,36 +15,38 @@ import (
 )
 
 type pollerHandler struct {
-	key       string
-	_addr     weak.Pointer[[]Event]
-	_signalFn func(*Event) bool
+	key      string
+	addrs    weak.Pointer[[]Event]
+	signalFn func(*Event) bool
 }
 
 type hubEntry struct {
-	lrEvent   Event
-	_wakerCh  chan struct{}
-	_handlers []pollerHandler
+	lrEvent  Event
+	wakerCh  chan struct{}
+	handlers []pollerHandler
 }
 
 type hub struct {
-	hcache     map[string]*hubEntry
-	mcache     btree.Btree[string, weak.Pointer[[]Event]]
-	_mu        vino.RWMutex
-	_ctx       context.Context
-	_cancel    context.CancelFunc
-	_iclient   iredis.WrappedRedis
-	_handlerCh chan pollerHandler
+	hcache map[string]*hubEntry
+	mcache btree.Btree[string, weak.Pointer[[]Event]]
+
+	mu        MutexRW
+	ctx       context.Context
+	cancel    context.CancelFunc
+	iclient   iredis.WrappedRedis
+	handlerCh chan pollerHandler
 }
 
 func initHub(ctx context.Context, fn func() *redis.Client) (*hub, error) {
 	cctx, cancel := context.WithCancel(ctx)
 	client := &hub{
-		hcache:     make(map[string]*hubEntry),
-		mcache:     btree.NewBtree[string, weak.Pointer[[]Event]](btree.CmpString),
-		_ctx:       cctx,
-		_cancel:    cancel,
-		_iclient:   *iredis.NewIredis(fn),
-		_handlerCh: make(chan pollerHandler, 32),
+		hcache: make(map[string]*hubEntry),
+		mcache: btree.NewBtree[string, weak.Pointer[[]Event]](btree.CmpString),
+
+		ctx:       cctx,
+		cancel:    cancel,
+		iclient:   *iredis.NewIredis(fn),
+		handlerCh: make(chan pollerHandler, 32),
 	}
 
 	if err := fn().Ping(ctx).Err(); err != nil {
@@ -63,16 +65,17 @@ func (p *hub) Data(key string, opts ...PollOption) poller {
 
 	var ptr unsafe.Pointer
 	updateCh := make(chan Event, 1)
-	cctx, cancel := context.WithCancel(p._ctx)
+	cctx, cancel := context.WithCancel(p.ctx)
 	poller := &basePoller{
-		key:               key,
-		keepAlive:         config.keepAlive,
-		recvHeartbeat:     config.recvHeartbeat,
-		_addr:             ptr,
-		_ctx:              cctx,
-		_cancel:           cancel,
-		_updateCh:         updateCh,
-		_onWatchCloseHook: config._onWatchCloseHook,
+		key:           key,
+		keepAlive:     config.keepAlive,
+		recvHeartbeat: config.recvHeartbeat,
+
+		addr:             ptr,
+		ctx:              cctx,
+		cancel:           cancel,
+		updateCh:         updateCh,
+		onWatchCloseHook: config._onWatchCloseHook,
 	}
 
 	p.mcache.AtomicPut(
@@ -84,7 +87,7 @@ func (p *hub) Data(key string, opts ...PollOption) poller {
 			}
 			es := make([]Event, 0)
 			ptr = unsafe.Pointer(&es)
-			p._handlerCh <- pollerHandler{key, weak.Make(&es), signalfunc(poller)}
+			p.handlerCh <- pollerHandler{key, weak.Make(&es), signalFunc(poller)}
 			return weak.Make(&es), true
 		})
 
@@ -92,7 +95,7 @@ func (p *hub) Data(key string, opts ...PollOption) poller {
 }
 
 func (p *hub) Stop() {
-	p._cancel()
+	p.cancel()
 }
 
 // TODO: impl
@@ -103,21 +106,21 @@ func (p *hub) Bind(k string, s any, opts ...PollOption) poller {
 func (p *hub) start() {
 	for {
 		select {
-		case <-p._ctx.Done():
-			p._cancel()
+		case <-p.ctx.Done():
+			p.cancel()
 			return
-		case handler := <-p._handlerCh:
-			p._mu.Lock()
+		case handler := <-p.handlerCh:
+			p.mu.Lock()
 			ctx, cancel := context.WithCancel(context.Background())
 			if _, ok := p.hcache[handler.key]; !ok {
 				waker := make(chan struct{})
-				p.hcache[handler.key] = &hubEntry{_wakerCh: waker}
+				p.hcache[handler.key] = &hubEntry{wakerCh: waker}
 				go p.startKey(handler.key, waker, ctx.Done())
 			}
-			handlers := p.hcache[handler.key]._handlers
-			p.hcache[handler.key]._handlers = append(handlers, handler)
+			handlers := p.hcache[handler.key].handlers
+			p.hcache[handler.key].handlers = append(handlers, handler)
 			cancel()
-			p._mu.Unlock()
+			p.mu.Unlock()
 		}
 	}
 }
@@ -130,18 +133,18 @@ func (p *hub) startKey(key string, waker <-chan struct{}, blocker <-chan struct{
 		var e *Event
 		select {
 		case <-waker:
-			p._mu.RLock()
+			p.mu.RLock()
 			dup := p.hcache[key].lrEvent
 			e = &dup
 			slog.Debug("Sig from waker", "key", key, "event", e)
-			p._mu.RUnlock()
+			p.mu.RUnlock()
 		case <-ticker.C:
-			e = p.updateCache(p._ctx, key, nil)
+			e = p.updateCache(p.ctx, key, nil)
 		}
 
-		p._mu.RLock()
-		if len(p.hcache[key]._handlers) == 0 {
-			p._mu.RUnlock()
+		p.mu.RLock()
+		if len(p.hcache[key].handlers) == 0 {
+			p.mu.RUnlock()
 			return
 		}
 
@@ -166,19 +169,19 @@ func (p *hub) startKey(key string, waker <-chan struct{}, blocker <-chan struct{
 		}
 
 		handlers := []pollerHandler{}
-		for _, h := range p.hcache[key]._handlers {
-			if h._signalFn(e) {
+		for _, h := range p.hcache[key].handlers {
+			if h.signalFn(e) {
 				handlers = append(handlers, h)
 			}
 		}
-		p._mu.RUpgrade()
-		p.hcache[key]._handlers = handlers
-		p._mu.Unlock()
+		p.mu.RLifted()
+		p.hcache[key].handlers = handlers
+		p.mu.Unlock()
 	}
 }
 
 func (p *hub) Update(key string, upd Updater, expiration time.Duration) error {
-	ctx, cancel := context.WithTimeout(p._ctx, 5*time.Second)
+	ctx, cancel := context.WithTimeout(p.ctx, 5*time.Second)
 	defer cancel()
 	if e := p.updateCache(ctx, key, nil); e != nil {
 		// Remote already has newer event
@@ -187,10 +190,10 @@ func (p *hub) Update(key string, upd Updater, expiration time.Duration) error {
 	}
 
 	due, _ := ctx.Deadline()
-	if val, ok := p._iclient.BlockSetNX(ctx, key, due); !ok {
+	if val, ok := p.iclient.BlockSetNX(ctx, key, due); !ok {
 		return ErrRedisSetNX
 	} else {
-		defer p._iclient.MatchDelNX(ctx, key, val)
+		defer p.iclient.MatchDelNX(ctx, key, val)
 	}
 
 	// Double check
@@ -206,13 +209,13 @@ func (p *hub) Update(key string, upd Updater, expiration time.Duration) error {
 	}
 
 	// Update local event
-	if e, err := p._iclient.Set(ctx, key, val); err != nil {
+	if e, err := p.iclient.Set(ctx, key, val); err != nil {
 		slog.Debug("Failed to update local event", "key", key, "error", err)
 		return err
 	} else {
-		p._mu.RLock()
+		p.mu.RLock()
 		lrEvent := p.hcache[key].lrEvent
-		p._mu.RUnlock()
+		p.mu.RUnlock()
 		newEvent := lrEvent.MergeEvents([]Event{e})
 		p.updateCache(ctx, key, &newEvent)
 		slog.Debug("Updated local event", "key", key, "event", newEvent)
@@ -228,67 +231,67 @@ func (p *hub) updateCache(ctx context.Context, key string, event *Event) *Event 
 	hasUpdate := false
 	defer func() {
 		if hasUpdate {
-			p._mu.RLock()
+			p.mu.RLock()
 			if handler, ok := p.hcache[key]; ok {
 				slog.Debug("Wake up handler", "key", key, "event", event)
 				select {
-				case handler._wakerCh <- struct{}{}:
+				case handler.wakerCh <- struct{}{}:
 				default:
 				}
 			}
-			p._mu.RUnlock()
+			p.mu.RUnlock()
 		}
 	}()
 
 	if event != nil {
-		p._mu.Lock()
+		p.mu.Lock()
 		lrEvent := p.hcache[key].lrEvent
 		if lrEvent.Version < event.Version ||
 			(lrEvent.Version == event.Version && lrEvent.NewValue != event.NewValue) {
 			hasUpdate = true
 			p.hcache[key].lrEvent = *event
-			p._mu.Unlock()
+			p.mu.Unlock()
 			return event
 		}
-		p._mu.Unlock()
+		p.mu.Unlock()
 		return nil
 	}
 
-	newEvent, err := p._iclient.Get(ctx, key)
+	newEvent, err := p.iclient.Get(ctx, key)
 	if err != nil {
 		return nil
 	}
 
-	p._mu.RLock()
+	p.mu.RLock()
 	oldEvent := p.hcache[key].lrEvent
 	if oldEvent.Version > newEvent.Version {
 		ver := oldEvent.Version + 1
-		p._mu.RUnlock()
-		if err := p._iclient.SetVer(ctx, key, ver); err != nil {
+		p.mu.RUnlock()
+		if err := p.iclient.SetVer(ctx, key, ver); err != nil {
 			return nil
 		}
 		newEvent.Version = ver
-		p._mu.Lock()
+		p.mu.Lock()
 		oldEvent = p.hcache[key].lrEvent
 		if oldEvent.Version < newEvent.Version ||
 			oldEvent.Version == newEvent.Version && oldEvent.NewValue != newEvent.NewValue {
 			hasUpdate = true
 			p.hcache[key].lrEvent = newEvent
-			p._mu.Unlock()
+			p.mu.Unlock()
 			return &newEvent
 		}
-		p._mu.Unlock()
+		p.mu.Unlock()
 	}
 
 	if oldEvent.Version < newEvent.Version ||
 		oldEvent.Version == newEvent.Version && oldEvent.NewValue != newEvent.NewValue {
-		p._mu.RUpgrade()
+		p.mu.RLifted()
 		hasUpdate = true
 		p.hcache[key].lrEvent = newEvent
-		p._mu.Unlock()
+		p.mu.Unlock()
 		return &newEvent
 	}
-	defer p._mu.RUnlock()
+	defer p.mu.RUnlock()
 	p.mcache.AtomicPut(
 		key,
 		func(oldV weak.Pointer[[]Event], exists bool) (weak.Pointer[[]Event], bool) {

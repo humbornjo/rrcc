@@ -5,7 +5,7 @@ go 1.24.1
 require (
 	github.com/alicebob/miniredis v2.5.0+incompatible
 	github.com/google/uuid v1.6.0
-	github.com/humbornjo/vino v0.0.0-20250320125528-e690f31cfe43
+	github.com/humbornjo/vino v0.0.0-20250330171907-5317ad00b93d
 	github.com/redis/go-redis/v9 v9.7.1
 	github.com/stretchr/testify v1.10.0
 	modernc.org/b/v2 v2.1.2
